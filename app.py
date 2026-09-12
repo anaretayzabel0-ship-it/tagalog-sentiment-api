@@ -1,18 +1,38 @@
+import gc
 import os
 
+import torch
 from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
-from transformers import pipeline
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 app = FastAPI()
 
-# Loaded ONCE when the container starts (not per-request). After the first
-# request wakes a sleeping free-tier Space, every request after that is
-# fast -- only the wake-up itself is slow.
+MODEL_NAME = "dost-asti/RoBERTa-tl-sentiment-analysis"
+
+# Load with low_cpu_mem_usage to avoid a memory spike while loading, then
+# quantize the linear layers to int8. This roughly quarters the model's
+# memory footprint (the bulk of a transformer's weights live in its linear
+# layers), which is what makes this fit inside a 512MB instance.
+_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+_model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME, low_cpu_mem_usage=True
+)
+_model.eval()
+_model = torch.quantization.quantize_dynamic(
+    _model, {torch.nn.Linear}, dtype=torch.qint8
+)
+
+# Free the pre-quantization references so the original fp32 weights can be
+# garbage-collected rather than sitting in memory alongside the quantized copy.
+gc.collect()
+
 classifier = pipeline(
     "text-classification",
-    model="dost-asti/RoBERTa-tl-sentiment-analysis",
+    model=_model,
+    tokenizer=_tokenizer,
     top_k=None,  # return all 3 class scores so we can pick the top one
+    device=-1,  # force CPU
 )
 
 # The model's config.json only exposes generic LABEL_0/1/2 -- this is the
